@@ -18,24 +18,28 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
 #include <getopt.h>
+#include <signal.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_syswm.h>
 #include <SDL2/SDL_ttf.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <pwd.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <libconfig.h>
 #include <fontconfig/fontconfig.h>
 
 #include "debug.h"
 #include "utils.h"
 #include "KVMFR.h"
-#include "ivshmem/ivshmem.h"
 #include "spice/spice.h"
 #include "kb.h"
 
@@ -43,67 +47,103 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 
 struct AppState
 {
-  bool      running;
-  bool      started;
+  bool                 running;
+  bool                 started;
+  bool                 keyDown[SDL_NUM_SCANCODES];
 
-  TTF_Font       *font;
-  SDL_Point       srcSize;
-  LG_RendererRect dstRect;
-  SDL_Point       cursor;
-  bool            haveCursorPos;
-  float           scaleX, scaleY;
+  TTF_Font           * font;
+  TTF_Font           * alertFont;
+  SDL_Point            srcSize;
+  LG_RendererRect      dstRect;
+  SDL_Point            cursor;
+  bool                 cursorVisible;
+  bool                 haveCursorPos;
+  float                scaleX, scaleY;
+  float                accX, accY;
 
-  const LG_Renderer * lgr ;
-  void              * lgrData;
+  const LG_Renderer  * lgr ;
+  void               * lgrData;
 
   SDL_Window         * window;
+  int                  shmFD;
   struct KVMFRHeader * shm;
   unsigned int         shmSize;
+  int64_t              fpsSleep;
 };
+
+typedef struct RenderOpts
+{
+  unsigned int          size;
+  unsigned int          argc;
+  LG_RendererOptValue * argv;
+}
+RendererOpts;
 
 struct AppParams
 {
+  const char * configFile;
   bool         autoResize;
   bool         allowResize;
   bool         keepAspect;
   bool         borderless;
+  bool         fullscreen;
   bool         center;
   int          x, y;
   unsigned int w, h;
-  const char * ivshmemSocket;
-  bool         useMipmap;
+  char       * shmFile;
+  unsigned int shmSize;
+  unsigned int fpsLimit;
   bool         showFPS;
   bool         useSpice;
-  const char * spiceHost;
+  char       * spiceHost;
   unsigned int spicePort;
   bool         scaleMouseInput;
   bool         hideMouse;
+  bool         ignoreQuit;
+  bool         allowScreensaver;
+  bool         grabKeyboard;
+  SDL_Scancode captureKey;
+
+  bool         forceRenderer;
+  unsigned int forceRendererIndex;
+  RendererOpts rendererOpts[LG_RENDERER_COUNT];
 };
 
 struct AppState  state;
 struct AppParams params =
 {
+  .configFile       = "/etc/looking-glass.conf",
   .autoResize       = false,
   .allowResize      = true,
   .keepAspect       = true,
   .borderless       = false,
+  .fullscreen       = false,
   .center           = true,
   .x                = 0,
   .y                = 0,
   .w                = 1024,
   .h                = 768,
-  .ivshmemSocket    = "/tmp/ivshmem_socket",
-  .useMipmap        = true,
+  .shmFile          = "/dev/shm/looking-glass",
+  .shmSize          = 0,
+  .fpsLimit         = 200,
   .showFPS          = false,
   .useSpice         = true,
   .spiceHost        = "127.0.0.1",
   .spicePort        = 5900,
   .scaleMouseInput  = true,
-  .hideMouse        = true
+  .hideMouse        = true,
+  .ignoreQuit       = false,
+  .allowScreensaver = true,
+  .captureKey       = SDL_SCANCODE_SCROLLLOCK,
+  .grabKeyboard     = true,
+  .forceRenderer    = false
 };
 
-inline void updatePositionInfo()
+static inline void updatePositionInfo()
 {
+  if (!state.started)
+    return;
+
   int w, h;
   SDL_GetWindowSize(state.window, &w, &h);
 
@@ -143,190 +183,222 @@ inline void updatePositionInfo()
 
 int renderThread(void * unused)
 {
-  bool                error = false;
-  struct KVMFRHeader  header;
-  volatile uint32_t * updateCount = &state.shm->updateCount;
-
   while(state.running)
   {
-    // poll until we have a new frame, or we time out
-    while(header.updateCount == *updateCount && state.running)
-    {
-      const struct timespec s =
-      {
-        .tv_sec  = 0,
-        .tv_nsec = 1000
-      };
-      nanosleep(&s, NULL);
-    }
+    const uint64_t start = microtime();
 
-    if (!state.running)
+    if (!state.lgr->render(state.lgrData, state.window))
       break;
 
-    // we must take a copy of the header, both to let the guest advance and to
-    // prevent the contained arguments being abused to overflow buffers
-    memcpy(&header, state.shm, sizeof(struct KVMFRHeader));
-    __sync_or_and_fetch(&state.shm->flags, KVMFR_HEADER_FLAG_READY);
-
-    // check the header's magic and version are valid
-    if (
-      memcmp(header.magic, KVMFR_HEADER_MAGIC, sizeof(KVMFR_HEADER_MAGIC)) != 0 ||
-      header.version != KVMFR_HEADER_VERSION
-    ){
-      usleep(1000);
-      continue;
-    }
-
-    // if we have a frame
-    if (header.flags & KVMFR_HEADER_FLAG_FRAME)
+    const uint64_t total = microtime() - start;
+    if (total < state.fpsSleep)
     {
-      // sainty check of the frame format
-      if (
-        header.frame.type    >= FRAME_TYPE_MAX ||
-        header.frame.width   == 0 ||
-        header.frame.height  == 0 ||
-        header.frame.stride  == 0 ||
-        header.frame.dataPos == 0 ||
-        header.frame.dataPos > state.shmSize
-      ){
-        usleep(1000);
-        continue;
-      }
-
-      // setup the renderer format with the frame format details
-      LG_RendererFormat lgrFormat;
-      lgrFormat.width  = header.frame.width;
-      lgrFormat.height = header.frame.height;
-      lgrFormat.stride = header.frame.stride;
-
-      switch(header.frame.type)
-      {
-        case FRAME_TYPE_ARGB:
-          lgrFormat.pitch = header.frame.stride * 4;
-          lgrFormat.bpp   = 32;
-          break;
-
-        case FRAME_TYPE_RGB:
-          lgrFormat.pitch = header.frame.stride * 3;
-          lgrFormat.bpp   = 24;
-          break;
-
-        default:
-          DEBUG_ERROR("Unsupported frameType");
-          error = true;
-          break;
-      }
-
-      if (error)
-        break;
-
-      // check the header's dataPos is sane
-      const size_t dataSize = lgrFormat.height * lgrFormat.pitch;
-      if (header.frame.dataPos + dataSize > state.shmSize)
-      {
-        DEBUG_ERROR("The guest sent an invalid dataPos");
-        break;
-      }
-
-      // check if the renderer needs reconfiguration
-      if (!state.lgr->is_compatible(state.lgrData, lgrFormat))
-      {
-        DEBUG_INFO("Data Format: w=%u, h=%u, s=%u, p=%u, bpp=%u",
-            lgrFormat.width, lgrFormat.height, lgrFormat.stride, lgrFormat.pitch, lgrFormat.bpp);
-
-        state.lgr->deconfigure(state.lgrData);
-        if (!state.lgr->configure(state.lgrData, state.window, lgrFormat))
-        {
-          DEBUG_ERROR("Failed to reconfigure %s", state.lgr->get_name());
-          break;
-        }
-
-        state.srcSize.x = header.frame.width;
-        state.srcSize.y = header.frame.height;
-        if (params.autoResize)
-          SDL_SetWindowSize(state.window, header.frame.width, header.frame.height);
-        updatePositionInfo();
-      }
-
-      const uint8_t * data = (const uint8_t *)state.shm + header.frame.dataPos;
-      if (!state.lgr->on_frame_event(state.lgrData, data))
-      {
-        DEBUG_ERROR("Failed to render the frame");
-        break;
-      }
+      usleep(state.fpsSleep - total);
+      int64_t delta   = (1000000 / params.fpsLimit) - (microtime() - start);
+      state.fpsSleep += delta / 16;
+      if (state.fpsSleep < 0)
+        state.fpsSleep = 0;
     }
-
-    // if we have cursor data
-    if (header.flags & KVMFR_HEADER_FLAG_CURSOR)
-    {
-      if (header.cursor.flags & KVMFR_CURSOR_FLAG_POS)
-      {
-        state.cursor.x      = header.cursor.x;
-        state.cursor.y      = header.cursor.y;
-        state.haveCursorPos = true;
-      }
-
-      if (header.cursor.flags & KVMFR_CURSOR_FLAG_SHAPE)
-      {
-        LG_RendererCursor c = LG_CURSOR_COLOR;
-        switch(header.cursor.type)
-        {
-          case CURSOR_TYPE_COLOR       : c = LG_CURSOR_COLOR       ; break;
-          case CURSOR_TYPE_MONOCHROME  : c = LG_CURSOR_MONOCHROME  ; break;
-          case CURSOR_TYPE_MASKED_COLOR: c = LG_CURSOR_MASKED_COLOR; break;
-          default:
-            DEBUG_ERROR("Invalid cursor type");
-            break;
-        }
-
-        if (state.lgr)
-        {
-          if (!state.lgr->on_mouse_shape(
-            state.lgrData,
-            c,
-            header.cursor.w,
-            header.cursor.h,
-            header.cursor.pitch,
-            header.cursor.shape
-          ))
-          {
-            DEBUG_ERROR("Failed to update mouse shape");
-            break;
-          }
-        }
-      }
-
-      if (state.lgr)
-      {
-        state.lgr->on_mouse_event(
-          state.lgrData,
-          (header.cursor.flags & KVMFR_CURSOR_FLAG_VISIBLE) != 0,
-          state.cursor.x,
-          state.cursor.y
-        );
-      }
-    }
-
-    if (state.lgr)
-      state.lgr->render(state.lgrData);
   }
 
   return 0;
 }
 
-int ivshmemThread(void * arg)
+int cursorThread(void * unused)
 {
+  KVMFRCursor         header;
+  LG_RendererCursor   cursorType     = LG_CURSOR_COLOR;
+  uint32_t            version        = 0;
+
+  memset(&header, 0, sizeof(KVMFRCursor));
+
   while(state.running)
-    if (!ivshmem_process())
+  {
+    // poll until we have cursor data
+    if(!(state.shm->cursor.flags & KVMFR_CURSOR_FLAG_UPDATE))
     {
-      if (state.running)
+      if (!state.running)
+        return 0;
+
+      usleep(1000);
+      continue;
+    }
+
+    // we must take a copy of the header to prevent the contained arguments
+    // from being abused to overflow buffers.
+    memcpy(&header, &state.shm->cursor, sizeof(struct KVMFRCursor));
+
+    if (header.flags & KVMFR_CURSOR_FLAG_SHAPE &&
+        header.version != version)
+    {
+      version = header.version;
+
+      bool bad = false;
+      switch(header.type)
       {
-        state.running = false;
-        DEBUG_ERROR("failed to process ivshmem messages");
+        case CURSOR_TYPE_COLOR       : cursorType = LG_CURSOR_COLOR       ; break;
+        case CURSOR_TYPE_MONOCHROME  : cursorType = LG_CURSOR_MONOCHROME  ; break;
+        case CURSOR_TYPE_MASKED_COLOR: cursorType = LG_CURSOR_MASKED_COLOR; break;
+        default:
+          DEBUG_ERROR("Invalid cursor type");
+          bad = true;
+          break;
       }
+
+      if (bad)
+        break;
+
+      // check the data position is sane
+      const uint64_t dataSize = header.height * header.pitch;
+      if (header.dataPos + dataSize > state.shmSize)
+      {
+        DEBUG_ERROR("The guest sent an invalid mouse dataPos");
+        break;
+      }
+
+      const uint8_t * data = (const uint8_t *)state.shm + header.dataPos;
+      if (!state.lgr->on_mouse_shape(
+        state.lgrData,
+        cursorType,
+        header.width,
+        header.height,
+        header.pitch,
+        data)
+      )
+      {
+        DEBUG_ERROR("Failed to update mouse shape");
+        break;
+      }
+    }
+
+    // now we have taken the mouse data, we can flag to the host we are ready
+    state.shm->cursor.flags = 0;
+
+    if (header.flags & KVMFR_CURSOR_FLAG_POS)
+    {
+      state.cursor.x      = header.x;
+      state.cursor.y      = header.y;
+      state.cursorVisible = header.flags & KVMFR_CURSOR_FLAG_VISIBLE;
+      state.haveCursorPos = true;
+
+      state.lgr->on_mouse_event
+      (
+        state.lgrData,
+        state.cursorVisible,
+        state.cursor.x,
+        state.cursor.y
+      );
+    }
+  }
+
+  return 0;
+}
+
+int frameThread(void * unused)
+{
+  bool       error = false;
+  KVMFRFrame header;
+
+  memset(&header, 0, sizeof(struct KVMFRFrame));
+
+  while(state.running)
+  {
+    // poll until we have a new frame
+    if(!(state.shm->frame.flags & KVMFR_FRAME_FLAG_UPDATE))
+    {
+      if (!state.running)
+        break;
+
+      // allow for a maximum refresh of 400fps (1000/400 = 2.5ms), this should
+      // befreqent enough without chewing up too much CPU time
+      usleep(2500);
+      continue;
+    }
+
+    // we must take a copy of the header to prevent the contained
+    // arguments from being abused to overflow buffers.
+    memcpy(&header, &state.shm->frame, sizeof(struct KVMFRFrame));
+
+    // tell the host to continue as the host buffers up to one frame
+    // we can be sure the data for this frame wont be touched
+    __sync_and_and_fetch(&state.shm->frame.flags, ~KVMFR_FRAME_FLAG_UPDATE);
+
+    // sainty check of the frame format
+    if (
+      header.type    >= FRAME_TYPE_MAX ||
+      header.width   == 0 ||
+      header.height  == 0 ||
+      header.pitch   == 0 ||
+      header.dataPos == 0 ||
+      header.dataPos > state.shmSize ||
+      header.pitch   < header.width
+    ){
+      usleep(1000);
+      continue;
+    }
+
+    // setup the renderer format with the frame format details
+    LG_RendererFormat lgrFormat;
+    lgrFormat.width  = header.width;
+    lgrFormat.height = header.height;
+    lgrFormat.stride = header.stride;
+    lgrFormat.pitch  = header.pitch;
+
+    size_t dataSize;
+    switch(header.type)
+    {
+      case FRAME_TYPE_ARGB:
+        dataSize       = lgrFormat.height * lgrFormat.pitch;
+        lgrFormat.comp = LG_COMPRESSION_NONE;
+        lgrFormat.bpp  = 32;
+        break;
+
+      case FRAME_TYPE_H264:
+        dataSize       = lgrFormat.pitch;
+        lgrFormat.comp = LG_COMPRESSION_H264;
+        lgrFormat.bpp  = 0;
+        break;
+
+      default:
+        DEBUG_ERROR("Unsupported frameType");
+        error = true;
+        break;
+    }
+
+    if (error)
+      break;
+
+    // check the header's dataPos is sane
+    if (header.dataPos + dataSize > state.shmSize)
+    {
+      DEBUG_ERROR("The guest sent an invalid dataPos");
       break;
     }
 
+    if (header.width != state.srcSize.x || header.height != state.srcSize.y)
+    {
+      state.srcSize.x = header.width;
+      state.srcSize.y = header.height;
+      if (params.autoResize)
+        SDL_SetWindowSize(state.window, header.width, header.height);
+      updatePositionInfo();
+    }
+
+    const uint8_t * data = (const uint8_t *)state.shm + header.dataPos;
+    if (!state.lgr->on_frame_event(state.lgrData, lgrFormat, data))
+    {
+      DEBUG_ERROR("renderer on frame event returned failure");
+      break;
+    }
+
+    if (!state.started)
+    {
+      state.started = true;
+      updatePositionInfo();
+    }
+  }
+
+  state.running = false;
   return 0;
 }
 
@@ -343,7 +415,7 @@ int spiceThread(void * arg)
       break;
     }
 
-  spice_disconnect();
+  state.running = false;
   return 0;
 }
 
@@ -358,211 +430,286 @@ static inline const uint32_t mapScancode(SDL_Scancode scancode)
   return ps2;
 }
 
-int eventThread(void * arg)
+int eventFilter(void * userdata, SDL_Event * event)
 {
-  bool serverMode   = false;
-  bool realignGuest = true;
-  bool keyDown[SDL_NUM_SCANCODES];
+  static bool serverMode   = false;
+  static bool realignGuest = true;
 
-  memset(keyDown, 0, sizeof(keyDown));
-
-  // ensure mouse acceleration is identical in server mode
-  SDL_SetHintWithPriority(SDL_HINT_MOUSE_RELATIVE_MODE_WARP, "1", SDL_HINT_OVERRIDE);
-
-  while(state.running)
+  if (event->type == SDL_WINDOWEVENT)
   {
-    SDL_Event event;
-    if (!SDL_PollEvent(&event))
+    switch(event->window.event)
     {
-      usleep(1000);
-      continue;
+      case SDL_WINDOWEVENT_ENTER:
+        realignGuest = true;
+        break;
+
+      case SDL_WINDOWEVENT_SIZE_CHANGED:
+        updatePositionInfo();
+        realignGuest = true;
+        break;
     }
+    return 0;
+  }
 
-    switch(event.type)
+  if (!params.useSpice)
+    return 1;
+
+  switch(event->type)
+  {
+    case SDL_MOUSEMOTION:
     {
-      case SDL_QUIT:
-      state.running = false;
-      break;
-
-      case SDL_WINDOWEVENT:
+      if (
+        !serverMode && (
+          event->motion.x < state.dstRect.x                   ||
+          event->motion.x > state.dstRect.x + state.dstRect.w ||
+          event->motion.y < state.dstRect.y                   ||
+          event->motion.y > state.dstRect.y + state.dstRect.h
+        )
+      )
       {
-        switch(event.window.event)
-        {
-          case SDL_WINDOWEVENT_ENTER:
-            realignGuest = true;
-            break;
-
-          case SDL_WINDOWEVENT_SIZE_CHANGED:
-            updatePositionInfo();
-            realignGuest = true;
-            break;
-        }
+        realignGuest = true;
         break;
       }
-    }
 
-    if (!params.useSpice)
-      continue;
-
-    switch(event.type)
-    {
-      case SDL_KEYDOWN:
+      int x = 0;
+      int y = 0;
+      if (realignGuest && state.haveCursorPos)
       {
-        SDL_Scancode sc = event.key.keysym.scancode;
-        if (sc == SDL_SCANCODE_SCROLLLOCK)
+        x = event->motion.x - state.dstRect.x;
+        y = event->motion.y - state.dstRect.y;
+        if (params.scaleMouseInput && !serverMode)
         {
-          if (event.key.repeat)
-            break;
+          x = (float)x * state.scaleX;
+          y = (float)y * state.scaleY;
+        }
+        x -= state.cursor.x;
+        y -= state.cursor.y;
+        realignGuest = false;
+        state.accX = 0;
+        state.accY = 0;
 
-          serverMode = !serverMode;
-          spice_mouse_mode(serverMode);
-          SDL_SetRelativeMouseMode(serverMode);
+        if (!spice_mouse_motion(x, y))
+          DEBUG_ERROR("SDL_MOUSEMOTION: failed to send message");
+        break;
+      }
 
-          if (!serverMode)
-            realignGuest = true;
-          break;
+      x = event->motion.xrel;
+      y = event->motion.yrel;
+      if (x != 0 || y != 0)
+      {
+        if (params.scaleMouseInput && !serverMode)
+        {
+          state.accX += (float)x * state.scaleX;
+          state.accY += (float)y * state.scaleY;
+          x = floor(state.accX);
+          y = floor(state.accY);
+          state.accX -= x;
+          state.accY -= y;
         }
 
-        uint32_t scancode = mapScancode(sc);
-        if (scancode == 0)
+        if (!spice_mouse_motion(x, y))
+        {
+          DEBUG_ERROR("SDL_MOUSEMOTION: failed to send message");
+          break;
+        }
+      }
+
+      break;
+    }
+
+    case SDL_KEYDOWN:
+    {
+      SDL_Scancode sc = event->key.keysym.scancode;
+      if (sc == params.captureKey)
+      {
+        if (event->key.repeat)
           break;
 
+        serverMode = !serverMode;
+        spice_mouse_mode(serverMode);
+        SDL_SetRelativeMouseMode(serverMode);
+        SDL_SetWindowGrab(state.window, serverMode);
+        DEBUG_INFO("Server Mode: %s", serverMode ? "on" : "off");
+
+        if (state.lgr)
+          state.lgr->on_alert(
+            state.lgrData,
+            serverMode ? LG_ALERT_SUCCESS  : LG_ALERT_WARNING,
+            serverMode ? "Capture Enabled" : "Capture Disabled"
+          );
+
+        if (!serverMode)
+          realignGuest = true;
+        break;
+      }
+
+      uint32_t scancode = mapScancode(sc);
+      if (scancode == 0)
+        break;
+
+      if (!state.keyDown[sc])
+      {
         if (spice_key_down(scancode))
-          keyDown[sc] = true;
+          state.keyDown[sc] = true;
         else
         {
           DEBUG_ERROR("SDL_KEYDOWN: failed to send message");
           break;
         }
-        break;
       }
-
-      case SDL_KEYUP:
-      {
-        SDL_Scancode sc = event.key.keysym.scancode;
-        if (sc == SDL_SCANCODE_SCROLLLOCK)
-          break;
-
-        // avoid sending key up events when we didn't send a down
-        if (!keyDown[sc])
-          break;
-
-        uint32_t scancode = mapScancode(sc);
-        if (scancode == 0)
-          break;
-
-        if (spice_key_up(scancode))
-          keyDown[sc] = false;
-        else
-        {
-          DEBUG_ERROR("SDL_KEYUP: failed to send message");
-          break;
-        }
-        break;
-      }
-
-      case SDL_MOUSEWHEEL:
-        if (
-          !spice_mouse_press  (event.wheel.y == 1 ? 4 : 5) ||
-          !spice_mouse_release(event.wheel.y == 1 ? 4 : 5)
-          )
-        {
-          DEBUG_ERROR("SDL_MOUSEWHEEL: failed to send messages");
-          break;
-        }
-        break;
-
-      case SDL_MOUSEMOTION:
-      {
-        if (
-          !serverMode && (
-            event.motion.x < state.dstRect.x                   ||
-            event.motion.x > state.dstRect.x + state.dstRect.w ||
-            event.motion.y < state.dstRect.y                   ||
-            event.motion.y > state.dstRect.y + state.dstRect.h
-          )
-        )
-        {
-          realignGuest = true;
-          break;
-        }
-
-        int x = 0;
-        int y = 0;
-        if (realignGuest && state.haveCursorPos)
-        {
-          x = event.motion.x - state.dstRect.x;
-          y = event.motion.y - state.dstRect.y;
-          if (params.scaleMouseInput)
-          {
-            x = (float)x * state.scaleX;
-            y = (float)y * state.scaleY;
-          }
-          x -= state.cursor.x;
-          y -= state.cursor.y;
-          realignGuest = false;
-
-          if (!spice_mouse_motion(x, y))
-            DEBUG_ERROR("SDL_MOUSEMOTION: failed to send message");
-          break;
-        }
-
-        x = event.motion.xrel;
-        y = event.motion.yrel;
-        if (x != 0 || y != 0)
-        {
-          if (params.scaleMouseInput)
-          {
-            x = (float)x * state.scaleX;
-            y = (float)y * state.scaleY;
-          }
-          if (!spice_mouse_motion(x, y))
-          {
-            DEBUG_ERROR("SDL_MOUSEMOTION: failed to send message");
-            break;
-          }
-        }
-        break;
-      }
-
-      case SDL_MOUSEBUTTONDOWN:
-        if (
-          !spice_mouse_position(event.button.x, event.button.y) ||
-          !spice_mouse_press(event.button.button)
-        )
-        {
-          DEBUG_ERROR("SDL_MOUSEBUTTONDOWN: failed to send message");
-          break;
-        }
-        break;
-
-      case SDL_MOUSEBUTTONUP:
-        if (
-          !spice_mouse_position(event.button.x, event.button.y) ||
-          !spice_mouse_release(event.button.button)
-        )
-        {
-          DEBUG_ERROR("SDL_MOUSEBUTTONUP: failed to send message");
-          break;
-        }
-        break;
-
-      default:
-        break;
+      break;
     }
+
+    case SDL_KEYUP:
+    {
+      SDL_Scancode sc = event->key.keysym.scancode;
+      if (sc == params.captureKey)
+        break;
+
+      // avoid sending key up events when we didn't send a down
+      if (!state.keyDown[sc])
+        break;
+
+      uint32_t scancode = mapScancode(sc);
+      if (scancode == 0)
+        break;
+
+      if (spice_key_up(scancode))
+        state.keyDown[sc] = false;
+      else
+      {
+        DEBUG_ERROR("SDL_KEYUP: failed to send message");
+        break;
+      }
+      break;
+    }
+
+    case SDL_MOUSEWHEEL:
+      if (
+        !spice_mouse_press  (event->wheel.y == 1 ? 4 : 5) ||
+        !spice_mouse_release(event->wheel.y == 1 ? 4 : 5)
+        )
+      {
+        DEBUG_ERROR("SDL_MOUSEWHEEL: failed to send messages");
+        break;
+      }
+      break;
+
+    case SDL_MOUSEBUTTONDOWN:
+      // The SPICE protocol doesn't support more than a standard PS/2 3 button mouse
+      if (event->button.button > 3)
+        break;
+      if (
+        !spice_mouse_position(event->button.x, event->button.y) ||
+        !spice_mouse_press(event->button.button)
+      )
+      {
+        DEBUG_ERROR("SDL_MOUSEBUTTONDOWN: failed to send message");
+        break;
+      }
+      break;
+
+    case SDL_MOUSEBUTTONUP:
+      // The SPICE protocol doesn't support more than a standard PS/2 3 button mouse
+      if (event->button.button > 3)
+        break;
+      if (
+        !spice_mouse_position(event->button.x, event->button.y) ||
+        !spice_mouse_release(event->button.button)
+      )
+      {
+        DEBUG_ERROR("SDL_MOUSEBUTTONUP: failed to send message");
+        break;
+      }
+      break;
+
+    default:
+      return 1;
   }
 
   return 0;
 }
 
+void intHandler(int signal)
+{
+  switch(signal)
+  {
+    case SIGINT:
+      state.running = false;
+      break;
+  }
+}
+
+static void * map_memory()
+{
+  struct stat st;
+  if (stat(params.shmFile, &st) < 0)
+  {
+    DEBUG_ERROR("Failed to stat the shared memory file: %s", params.shmFile);
+    return NULL;
+  }
+
+  state.shmSize = params.shmSize ? params.shmSize : st.st_size;
+  state.shmFD   = open(params.shmFile, O_RDWR, (mode_t)0600);
+  if (state.shmFD < 0)
+  {
+    DEBUG_ERROR("Failed to open the shared memory file: %s", params.shmFile);
+    return NULL;
+  }
+
+  void * map = mmap(0, state.shmSize, PROT_READ | PROT_WRITE, MAP_SHARED, state.shmFD, 0);
+  if (map == MAP_FAILED)
+  {
+    DEBUG_ERROR("Failed to map the shared memory file: %s", params.shmFile);
+    close(state.shmFD);
+    state.shmFD = 0;
+    return NULL;
+  }
+
+  return map;
+}
+
+static bool try_renderer(const int index, const LG_RendererParams lgrParams, Uint32 * sdlFlags)
+{
+  const LG_Renderer *r    = LG_Renderers[index];
+  RendererOpts      *opts = &params.rendererOpts[index];
+
+  if (!IS_LG_RENDERER_VALID(r))
+  {
+    DEBUG_ERROR("FIXME: Renderer %d is invalid, skipping", index);
+    return false;
+  }
+
+  // create the renderer
+  state.lgrData = NULL;
+  if (!r->create(&state.lgrData, lgrParams))
+    return false;
+
+  // set it's options
+  for(unsigned int i = 0; i < opts->argc; ++i)
+    opts->argv[i].opt->handler(state.lgrData, opts->argv[i].value);
+
+  // initialize the renderer
+  if (!r->initialize(state.lgrData, sdlFlags))
+  {
+    r->deinitialize(state.lgrData);
+    return false;
+  }
+
+  DEBUG_INFO("Using Renderer: %s", r->get_name());
+  return true;
+}
+
 int run()
 {
   DEBUG_INFO("Looking Glass (" BUILD_VERSION ")");
+  DEBUG_INFO("Locking Method: " LG_LOCK_MODE);
 
   memset(&state, 0, sizeof(state));
-  state.running = true;
-  state.scaleX  = 1.0f;
-  state.scaleY  = 1.0f;
+  state.running  = true;
+  state.scaleX   = 1.0f;
+  state.scaleY   = 1.0f;
+  state.fpsSleep = 1000000 / params.fpsLimit;
 
   if (SDL_Init(SDL_INIT_VIDEO) < 0)
   {
@@ -570,71 +717,83 @@ int run()
     return -1;
   }
 
-  if (params.showFPS)
+  // override SDL's SIGINIT handler so that we can tell the difference between
+  // SIGINT and the user sending a close event, such as ALT+F4
+  signal(SIGINT, intHandler);
+
+  if (TTF_Init() < 0)
   {
-    if (TTF_Init() < 0)
-    {
-      DEBUG_ERROR("TTL_Init Failed");
-      return -1;
-    }
-
-    FcConfig  * config = FcInitLoadConfigAndFonts();
-    if (!config)
-    {
-      DEBUG_ERROR("FcInitLoadConfigAndFonts Failed");
-      return -1;
-    }
-
-    FcPattern * pat = FcNameParse((const FcChar8*)"FreeMono");
-    FcConfigSubstitute (config, pat, FcMatchPattern);
-    FcDefaultSubstitute(pat);
-    FcResult result;
-    FcChar8 * file = NULL;
-    FcPattern * font = FcFontMatch(config, pat, &result);
-
-    if (font && (FcPatternGetString(font, FC_FILE, 0, &file) == FcResultMatch))
-    {
-      state.font = TTF_OpenFont((char *)file, 14);
-      if (!state.font)
-      {
-        DEBUG_ERROR("TTL_OpenFont Failed");
-        return -1;
-      }
-    }
-    else
-    {
-      DEBUG_ERROR("Failed to locate a font for FPS display");
-      return -1;
-    }
-    FcPatternDestroy(pat);
+    DEBUG_ERROR("TTL_Init Failed");
+    return -1;
   }
 
+  FcConfig  * config = FcInitLoadConfigAndFonts();
+  if (!config)
+  {
+    DEBUG_ERROR("FcInitLoadConfigAndFonts Failed");
+    return -1;
+  }
+
+  FcPattern * pat = FcNameParse((const FcChar8*)"FreeMono");
+  FcConfigSubstitute (config, pat, FcMatchPattern);
+  FcDefaultSubstitute(pat);
+  FcResult result;
+  FcChar8 * file = NULL;
+  FcPattern * font = FcFontMatch(config, pat, &result);
+
+  if (font && (FcPatternGetString(font, FC_FILE, 0, &file) == FcResultMatch))
+  {
+    state.font = TTF_OpenFont((char *)file, 14);
+    if (!state.font)
+    {
+      DEBUG_ERROR("TTL_OpenFont Failed");
+      return -1;
+    }
+
+    state.alertFont = TTF_OpenFont((char *)file, 18);
+    if (!state.alertFont)
+    {
+      DEBUG_ERROR("TTL_OpenFont Failed");
+      return -1;
+    }
+  }
+  else
+  {
+    DEBUG_ERROR("Failed to locate a font for text display");
+    return -1;
+  }
+  FcPatternDestroy(pat);
+
   LG_RendererParams lgrParams;
-  lgrParams.font     = state.font;
-  lgrParams.resample = params.useMipmap;
-  lgrParams.showFPS  = params.showFPS;
+  lgrParams.font      = state.font;
+  lgrParams.alertFont = state.alertFont;
+  lgrParams.showFPS   = params.showFPS;
   Uint32 sdlFlags;
 
-  // probe for a a suitable renderer
-  for(const LG_Renderer **r = &LG_Renderers[0]; *r; ++r)
+  if (params.forceRenderer)
   {
-    if (!IS_LG_RENDERER_VALID(*r))
+    DEBUG_INFO("Trying forced renderer");
+    sdlFlags = 0;
+    if (!try_renderer(params.forceRendererIndex, lgrParams, &sdlFlags))
     {
-      DEBUG_ERROR("FIXME: Renderer %d is invalid, skipping", (int)(r - &LG_Renderers[0]));
-      continue;
+      DEBUG_ERROR("Forced renderer failed to iniailize");
+      return -1;
     }
-
-    state.lgrData = NULL;
-    sdlFlags      = 0;
-    if (!(*r)->initialize(&state.lgrData, lgrParams, &sdlFlags))
+    state.lgr = LG_Renderers[params.forceRendererIndex];
+  }
+  else
+  {
+    // probe for a a suitable renderer
+    for(unsigned int i = 0; i < LG_RENDERER_COUNT; ++i)
     {
-      (*r)->deinitialize(state.lgrData);
-      continue;
+      sdlFlags = 0;
+      if (try_renderer(i, lgrParams, &sdlFlags))
+      {
+        state.lgr = LG_Renderers[i];
+        DEBUG_INFO("Using: %s", state.lgr->get_name());
+        break;
+      }
     }
-
-    state.lgr = *r;
-    DEBUG_INFO("Initialized %s", (*r)->get_name());
-    break;
   }
 
   if (!state.lgr)
@@ -651,11 +810,18 @@ int run()
     params.h,
     (
       SDL_WINDOW_SHOWN |
+      (params.fullscreen  ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) |
       (params.allowResize ? SDL_WINDOW_RESIZABLE  : 0) |
       (params.borderless  ? SDL_WINDOW_BORDERLESS : 0) |
       sdlFlags
     )
   );
+
+  if (params.fullscreen)
+    SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
+
+  if (params.allowScreensaver)
+    SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
 
   // set the compositor hint to bypass for low latency
   SDL_SysWMinfo wminfo;
@@ -699,33 +865,19 @@ int run()
     SDL_ShowCursor(SDL_DISABLE);
   }
 
-  int         shm_fd    = 0;
-  SDL_Thread *t_ivshmem = NULL;
-  SDL_Thread *t_spice   = NULL;
-  SDL_Thread *t_event   = NULL;
+  SDL_Thread *t_spice  = NULL;
+  SDL_Thread *t_main   = NULL;
+  SDL_Thread *t_frame  = NULL;
+  SDL_Thread *t_render = NULL;
 
   while(1)
   {
-    if (!ivshmem_connect(params.ivshmemSocket))
-    {
-      DEBUG_ERROR("failed to connect to the ivshmem server");
-      break;
-    }
-
-    if (!(t_ivshmem = SDL_CreateThread(ivshmemThread, "ivshmemThread", NULL)))
-    {
-      DEBUG_ERROR("ivshmem create thread failed");
-      break;
-    }
-
-    state.shm = (struct KVMFRHeader *)ivshmem_get_map();
+    state.shm = (struct KVMFRHeader *)map_memory();
     if (!state.shm)
     {
       DEBUG_ERROR("Failed to map memory");
       break;
     }
-    state.shmSize     = ivshmem_get_map_size();
-    state.shm->hostID = ivshmem_get_id();
 
     if (params.useSpice)
     {
@@ -750,9 +902,14 @@ int run()
       }
     }
 
-    if (!(t_event = SDL_CreateThread(eventThread, "eventThread", NULL)))
+    // ensure mouse acceleration is identical in server mode
+    SDL_SetHintWithPriority(SDL_HINT_MOUSE_RELATIVE_MODE_WARP, "1", SDL_HINT_OVERRIDE);
+    SDL_SetEventFilter(eventFilter, NULL);
+
+    // start the renderThread so we don't just display junk
+    if (!(t_render = SDL_CreateThread(renderThread, "renderThread", NULL)))
     {
-      DEBUG_ERROR("gpu create thread failed");
+      DEBUG_ERROR("render create thread failed");
       break;
     }
 
@@ -761,27 +918,100 @@ int run()
     // also send us the current mouse shape since we won't know it yet
     DEBUG_INFO("Waiting for host to signal it's ready...");
     __sync_or_and_fetch(&state.shm->flags, KVMFR_HEADER_FLAG_RESTART);
+
     while(state.running && (state.shm->flags & KVMFR_HEADER_FLAG_RESTART))
+    {
+      SDL_Event event;
+      while(SDL_PollEvent(&event))
+      {
+        if (event.type == SDL_QUIT)
+        {
+          state.running = false;
+          break;
+        }
+      }
       usleep(1000);
+    }
+
+    if (!state.running)
+      break;
+
     DEBUG_INFO("Host ready, starting session");
 
-    renderThread(NULL);
+    // check the header's magic and version are valid
+    if (memcmp(state.shm->magic, KVMFR_HEADER_MAGIC, sizeof(KVMFR_HEADER_MAGIC)) != 0)
+    {
+      DEBUG_ERROR("Invalid header magic, is the host running?");
+      break;
+    }
+
+    if (state.shm->version != KVMFR_HEADER_VERSION)
+    {
+      DEBUG_ERROR("KVMFR version missmatch, expected %u but got %u", KVMFR_HEADER_VERSION, state.shm->version);
+      DEBUG_ERROR("This is not a bug, ensure you have the right version of looking-glass-host.exe on the guest");
+      break;
+    }
+
+
+    if (!(t_main = SDL_CreateThread(cursorThread, "cursorThread", NULL)))
+    {
+      DEBUG_ERROR("cursor create thread failed");
+      break;
+    }
+
+    if (!(t_frame = SDL_CreateThread(frameThread, "frameThread", NULL)))
+    {
+      DEBUG_ERROR("frame create thread failed");
+      break;
+    }
+
+    while(state.running)
+    {
+      SDL_Event event;
+      while(SDL_PollEvent(&event))
+      {
+        if (event.type == SDL_QUIT)
+        {
+          if (!params.ignoreQuit)
+            state.running = false;
+          break;
+        }
+      }
+      usleep(1000);
+    }
+
     break;
   }
 
   state.running = false;
 
-  if (t_event)
-    SDL_WaitThread(t_event, NULL);
+  if (t_render)
+    SDL_WaitThread(t_render, NULL);
 
-  // this needs to happen here to abort any waiting reads
-  // as ivshmem uses recvmsg which has no timeout
-  ivshmem_disconnect();
-  if (t_ivshmem)
-    SDL_WaitThread(t_ivshmem, NULL);
+  if (t_frame)
+    SDL_WaitThread(t_frame, NULL);
 
-  if (t_spice)
-    SDL_WaitThread(t_spice, NULL);
+  if (t_main)
+    SDL_WaitThread(t_main, NULL);
+
+  // if spice is still connected send key up events for any pressed keys
+  if (params.useSpice && spice_ready())
+  {
+    for(int i = 0; i < SDL_NUM_SCANCODES; ++i)
+      if (state.keyDown[i])
+      {
+        uint32_t scancode = mapScancode(i);
+        if (scancode == 0)
+          continue;
+        state.keyDown[i] = false;
+        spice_key_up(scancode);
+      }
+
+    if (t_spice)
+      SDL_WaitThread(t_spice, NULL);
+
+    spice_disconnect();
+  }
 
   if (state.lgr)
     state.lgr->deinitialize(state.lgrData);
@@ -792,8 +1022,11 @@ int run()
   if (cursor)
     SDL_FreeCursor(cursor);
 
-  if (shm_fd)
-    close(shm_fd);
+  if (state.shm)
+  {
+    munmap(state.shm, state.shmSize);
+    close(state.shmFD);
+  }
 
   TTF_Quit();
   SDL_Quit();
@@ -813,38 +1046,52 @@ void doHelp(char * app)
     "\n"
     "  -h        Print out this help\n"
     "\n"
-    "  -f PATH   Specify the path to the ivshmem socket [current: %s]\n"
+    "  -C PATH   Specify an additional configuration file to load\n"
+    "  -f PATH   Specify the path to the shared memory file [current: %s]\n"
+    "  -L SIZE   Specify the size in MB of the shared memory file (0 = detect) [current: %d]\n"
     "\n"
     "  -s        Disable spice client\n"
-    "  -c HOST   Specify the spice host [current: %s]\n"
-    "  -p PORT   Specify the spice port [current: %d]\n"
+    "  -c HOST   Specify the spice host or UNIX socket [current: %s]\n"
+    "  -p PORT   Specify the spice port or 0 for UNIX socket [current: %d]\n"
     "  -j        Disable cursor position scaling\n"
     "  -M        Don't hide the host cursor\n"
     "\n"
-    "  -m        Disable mipmapping\n"
-    "  -v        Disable VSync\n"
+    "  -K        Set the FPS limit [current: %d]\n"
     "  -k        Enable FPS display\n"
+    "  -g NAME   Force the use of a specific renderer\n"
+    "  -o OPTION Specify a renderer option (ie: opengl:vsync=0)\n"
+    "            Alternatively specify \"list\" to list all renderers and their options\n"
     "\n"
     "  -a        Auto resize the window to the guest\n"
     "  -n        Don't allow the window to be manually resized\n"
     "  -r        Don't maintain the aspect ratio\n"
     "  -d        Borderless mode\n"
+    "  -F        Borderless fullscreen mode\n"
     "  -x XPOS   Initial window X position [current: %s]\n"
     "  -y YPOS   Initial window Y position [current: %s]\n"
     "  -w WIDTH  Initial window width [current: %u]\n"
     "  -b HEIGHT Initial window height [current: %u]\n"
+    "  -Q        Ignore requests to quit (ie: Alt+F4)\n"
+    "  -S        Disable the screensaver\n"
+    "  -G        Don't capture the keyboard in capture mode\n"
+    "  -m CODE   Specify the capture key [current: %u (%s)]\n"
+    "            See https://wiki.libsdl.org/SDLScancodeLookup for valid values\n"
     "\n"
     "  -l        License information\n"
     "\n",
     app,
     app,
-    params.ivshmemSocket,
+    params.shmFile,
+    params.shmSize,
     params.spiceHost,
     params.spicePort,
+    params.fpsLimit,
     params.center ? "center" : x,
     params.center ? "center" : y,
     params.w,
-    params.h
+    params.h,
+    params.captureKey,
+    SDL_GetScancodeName(params.captureKey)
   );
 }
 
@@ -872,88 +1119,468 @@ void doLicense()
   );
 }
 
+static bool load_config(const char * configFile)
+{
+  config_t cfg;
+  int itmp;
+  const char *stmp;
+
+  config_init(&cfg);
+  if (!config_read_file(&cfg, configFile))
+  {
+    DEBUG_ERROR("Config file error %s:%d - %s",
+      config_error_file(&cfg),
+      config_error_line(&cfg),
+      config_error_text(&cfg)
+    );
+    return false;
+  }
+
+  config_setting_t * global = config_lookup(&cfg, "global");
+  if (global)
+  {
+    if (config_setting_lookup_string(global, "shmFile", &stmp))
+    {
+      free(params.shmFile);
+      params.shmFile = strdup(stmp);
+    }
+
+    if (config_setting_lookup_int(global, "shmSize", &itmp))
+      params.shmSize = itmp * 1024 * 1024;
+
+    if (config_setting_lookup_string(global, "forceRenderer", &stmp))
+    {
+      bool ok = false;
+      for(unsigned int i = 0; i < LG_RENDERER_COUNT; ++i)
+        if (strcasecmp(LG_Renderers[i]->get_name(), stmp) == 0)
+        {
+          params.forceRenderer      = true;
+          params.forceRendererIndex = i;
+          ok = true;
+          break;
+        }
+
+      if (!ok)
+      {
+        DEBUG_ERROR("No such renderer: %s", stmp);
+        config_destroy(&cfg);
+        return false;
+      }
+    }
+
+    if (config_setting_lookup_bool(global, "scaleMouseInput" , &itmp)) params.scaleMouseInput  = (itmp != 0);
+    if (config_setting_lookup_bool(global, "hideMouse"       , &itmp)) params.hideMouse        = (itmp != 0);
+    if (config_setting_lookup_bool(global, "showFPS"         , &itmp)) params.showFPS          = (itmp != 0);
+    if (config_setting_lookup_bool(global, "autoResize"      , &itmp)) params.autoResize       = (itmp != 0);
+    if (config_setting_lookup_bool(global, "allowResize"     , &itmp)) params.allowResize      = (itmp != 0);
+    if (config_setting_lookup_bool(global, "keepAspect"      , &itmp)) params.keepAspect       = (itmp != 0);
+    if (config_setting_lookup_bool(global, "borderless"      , &itmp)) params.borderless       = (itmp != 0);
+    if (config_setting_lookup_bool(global, "fullScreen"      , &itmp)) params.fullscreen       = (itmp != 0);
+    if (config_setting_lookup_bool(global, "ignoreQuit"      , &itmp)) params.ignoreQuit       = (itmp != 0);
+    if (config_setting_lookup_bool(global, "allowScreensaver", &itmp)) params.allowScreensaver = (itmp != 0);
+
+    if (config_setting_lookup_int(global, "x", &params.x)) params.center = false;
+    if (config_setting_lookup_int(global, "y", &params.y)) params.center = false;
+
+    if (config_setting_lookup_int(global, "w", &itmp))
+    {
+      if (itmp < 1)
+      {
+        DEBUG_ERROR("Invalid window width, must be greater then 1px");
+        config_destroy(&cfg);
+        return false;
+      }
+      params.w = (unsigned int)itmp;
+    }
+
+    if (config_setting_lookup_int(global, "h", &itmp))
+    {
+      if (itmp < 1)
+      {
+        DEBUG_ERROR("Invalid window height, must be greater then 1px");
+        config_destroy(&cfg);
+        return false;
+      }
+      params.h = (unsigned int)itmp;
+    }
+
+    if (config_setting_lookup_int(global, "fpsLimit", &itmp))
+    {
+      if (itmp < 1)
+      {
+        DEBUG_ERROR("Invalid FPS limit, must be greater then 0");
+        config_destroy(&cfg);
+        return false;
+      }
+      params.fpsLimit = (unsigned int)itmp;
+    }
+
+    if (config_setting_lookup_int(global, "captureKey", &itmp))
+    {
+      if (itmp <= SDL_SCANCODE_UNKNOWN || itmp > SDL_SCANCODE_APP2)
+      {
+        DEBUG_ERROR("Invalid capture key value, see https://wiki.libsdl.org/SDLScancodeLookup");
+        config_destroy(&cfg);
+        return false;
+      }
+      params.captureKey = (SDL_Scancode)itmp;
+    }
+  }
+
+  config_setting_t * spice = config_lookup(&cfg, "spice");
+  if (spice)
+  {
+    if (config_setting_lookup_bool(spice, "use", &itmp))
+      params.useSpice = (itmp != 0);
+
+    if (config_setting_lookup_string(spice, "host", &stmp))
+    {
+      free(params.spiceHost);
+      params.spiceHost = strdup(stmp);
+    }
+
+    if (config_setting_lookup_int(spice, "port", &itmp))
+    {
+      if (itmp < 0 || itmp > 65535)
+      {
+        DEBUG_ERROR("Invalid spice port");
+        config_destroy(&cfg);
+        return false;
+      }
+      params.spicePort = itmp;
+    }
+  }
+
+  for(unsigned int i = 0; i < LG_RENDERER_COUNT; ++i)
+  {
+    const LG_Renderer * r     = LG_Renderers[i];
+    RendererOpts      * opts  = &params.rendererOpts[i];
+    config_setting_t  * group = config_lookup(&cfg, r->get_name());
+    if (!group)
+      continue;
+
+    for(unsigned int j = 0; j < r->option_count; ++j)
+    {
+      const char * name = r->options[j].name;
+      if (!config_setting_lookup_string(group, name, &stmp))
+        continue;
+
+      if (r->options[j].validator && !r->options[j].validator(stmp))
+      {
+        DEBUG_ERROR("Renderer \"%s\" reported invalid value for option \"%s\"", r->get_name(), name);
+        config_destroy(&cfg);
+        return false;
+      }
+
+      if (opts->argc == opts->size)
+      {
+        opts->size += 5;
+        opts->argv  = realloc(opts->argv, sizeof(LG_RendererOptValue) * opts->size);
+      }
+
+      opts->argv[opts->argc].opt   = &r->options[j];
+      opts->argv[opts->argc].value = strdup(stmp);
+      ++opts->argc;
+    }
+  }
+
+  config_destroy(&cfg);
+  return true;
+}
+
 int main(int argc, char * argv[])
 {
-  int c;
-  while((c = getopt(argc, argv, "hf:sc:p:jMmkanrdx:y:w:b:l")) != -1)
-    switch(c)
+  params.shmFile   = strdup(params.shmFile  );
+  params.spiceHost = strdup(params.spiceHost);
+
+  {
+    // load any global then local config options first
+    struct stat st;
+    if (stat("/etc/looking-glass.conf", &st) >= 0)
+    {
+      DEBUG_INFO("Loading config from: /etc/looking-glass.conf");
+      if (!load_config("/etc/looking-glass.conf"))
+        return -1;
+    }
+
+    struct passwd * pw = getpwuid(getuid());
+    const char pattern[] = "%s/.looking-glass.conf";
+    const size_t len = strlen(pw->pw_dir) + sizeof(pattern);
+    char buffer[len];
+    snprintf(buffer, len, pattern, pw->pw_dir);
+    if (stat(buffer, &st) >= 0)
+    {
+      DEBUG_INFO("Loading config from: %s", buffer);
+      if (!load_config(buffer))
+        return -1;
+    }
+  }
+
+  for(;;)
+  {
+    switch(getopt(argc, argv, "hC:f:L:sc:p:jMvK:kg:o:anrdFx:y:w:b:QSGm:l"))
     {
       case '?':
       case 'h':
       default :
         doHelp(argv[0]);
-        return (c == 'h') ? 0 : -1;
+        return -1;
+
+      case -1:
+        break;
+
+      case 'C':
+        params.configFile = optarg;
+        if (!load_config(optarg))
+          return -1;
+        continue;
 
       case 'f':
-        params.ivshmemSocket = optarg;
-        break;
+        free(params.shmFile);
+        params.shmFile = strdup(optarg);
+        continue;
+
+      case 'L':
+        params.shmSize = atoi(optarg) * 1024 * 1024;
+        continue;
 
       case 's':
         params.useSpice = false;
-        break;
+        continue;
 
       case 'c':
-        params.spiceHost = optarg;
-        break;
+        free(params.spiceHost);
+        params.spiceHost = strdup(optarg);
+        continue;
 
       case 'p':
         params.spicePort = atoi(optarg);
-        break;
+        continue;
 
       case 'j':
         params.scaleMouseInput = false;
-        break;
+        continue;
 
       case 'M':
         params.hideMouse = false;
-        break;
+        continue;
 
-      case 'm':
-        params.useMipmap = false;
-        break;
+      case 'K':
+        params.fpsLimit = atoi(optarg);
+        continue;
 
       case 'k':
         params.showFPS = true;
-        break;
+        continue;
+
+      case 'g':
+      {
+        bool ok = false;
+        for(unsigned int i = 0; i < LG_RENDERER_COUNT; ++i)
+          if (strcasecmp(LG_Renderers[i]->get_name(), optarg) == 0)
+          {
+            params.forceRenderer      = true;
+            params.forceRendererIndex = i;
+            ok = true;
+            break;
+          }
+
+        if (!ok)
+        {
+          fprintf(stderr, "No such renderer: %s\n", optarg);
+          fprintf(stderr, "Use '-o list' obtain a list of options\n");
+          doHelp(argv[0]);
+          return -1;
+        }
+
+        continue;
+      }
+
+      case 'o':
+      {
+        if (strcasecmp(optarg, "list") == 0)
+        {
+          size_t maxLen = 0;
+          for(unsigned int i = 0; i < LG_RENDERER_COUNT; ++i)
+          {
+            const LG_Renderer * r = LG_Renderers[i];
+            for(unsigned int j = 0; j < r->option_count; ++j)
+            {
+              const size_t len = strlen(r->options[j].name);
+              if (len > maxLen)
+                maxLen = len;
+            }
+          }
+
+          fprintf(stderr, "\nRenderer Option List\n");
+          for(unsigned int i = 0; i < LG_RENDERER_COUNT; ++i)
+          {
+            const LG_Renderer * r = LG_Renderers[i];
+            fprintf(stderr, "\n%s\n", r->get_name());
+            for(unsigned int j = 0; j < r->option_count; ++j)
+            {
+              const size_t pad = maxLen - strlen(r->options[j].name);
+              for(int i = 0; i < pad; ++i)
+                fputc(' ', stderr);
+
+              fprintf(stderr, "  %s - %s\n", r->options[j].name, r->options[j].desc);
+            }
+          }
+          fprintf(stderr, "\n");
+          return -1;
+        }
+
+        const LG_Renderer  * renderer = NULL;
+        RendererOpts       * opts     = NULL;
+
+        const size_t len  = strlen(optarg);
+        const char * name = strtok(optarg, ":");
+
+        for(unsigned int i = 0; i < LG_RENDERER_COUNT; ++i)
+          if (strcasecmp(LG_Renderers[i]->get_name(), name) == 0)
+          {
+            renderer = LG_Renderers[i];
+            opts     = &params.rendererOpts[i];
+            break;
+          }
+
+        if (!renderer)
+        {
+          fprintf(stderr, "No such renderer: %s\n", name);
+          doHelp(argv[0]);
+          return -1;
+        }
+
+        const char * option = strtok(NULL  , "=");
+        if (!option)
+        {
+          fprintf(stderr, "Renderer option name not specified\n");
+          doHelp(argv[0]);
+          return -1;
+        }
+
+        const LG_RendererOpt * opt = NULL;
+        for(unsigned int i = 0; i < renderer->option_count; ++i)
+          if (strcasecmp(option, renderer->options[i].name) == 0)
+          {
+            opt = &renderer->options[i];
+            break;
+          }
+
+        if (!opt)
+        {
+          fprintf(stderr, "Renderer \"%s\" doesn't have the option: %s\n", renderer->get_name(), option);
+          doHelp(argv[0]);
+          return -1;
+        }
+
+        const char * value = NULL;
+        if (len > strlen(name) + strlen(option) + 2)
+          value = option + strlen(option) + 1;
+
+        if (opt->validator && !opt->validator(value))
+        {
+          fprintf(stderr, "Renderer \"%s\" reported invalid value for option \"%s\"\n", renderer->get_name(), option);
+          doHelp(argv[0]);
+          return -1;
+        }
+
+        if (opts->argc == opts->size)
+        {
+          opts->size += 5;
+          opts->argv  = realloc(opts->argv, sizeof(LG_RendererOptValue) * opts->size);
+        }
+
+        opts->argv[opts->argc].opt   = opt;
+        opts->argv[opts->argc].value = strdup(value);
+        ++opts->argc;
+        continue;
+      }
 
       case 'a':
         params.autoResize = true;
-        break;
+        continue;
 
       case 'n':
         params.allowResize = false;
-        break;
+        continue;
 
       case 'r':
         params.keepAspect = false;
-        break;
+        continue;
 
       case 'd':
         params.borderless = true;
-        break;
+        continue;
+
+      case 'F':
+        params.fullscreen = true;
+        continue;
 
       case 'x':
         params.center = false;
         params.x = atoi(optarg);
-        break;
+        continue;
 
       case 'y':
         params.center = false;
         params.y = atoi(optarg);
-        break;
+        continue;
 
       case 'w':
         params.w = atoi(optarg);
-        break;
+        continue;
 
       case 'b':
         params.h = atoi(optarg);
-        break;
+        continue;
+
+      case 'Q':
+        params.ignoreQuit = true;
+        continue;
+
+      case 'S':
+        params.allowScreensaver = false;
+        continue;
+
+      case 'G':
+        params.grabKeyboard = false;
+        continue;
+
+      case 'm':
+        params.captureKey = atoi(optarg);
+        continue;
 
       case 'l':
         doLicense();
         return 0;
     }
+    break;
+  }
 
-  return run();
+  if (optind != argc)
+  {
+    fprintf(stderr, "A non option was supplied\n");
+    doHelp(argv[0]);
+    return -1;
+  }
+
+  if (params.grabKeyboard)
+  {
+    SDL_SetHint(SDL_HINT_GRAB_KEYBOARD, "1");
+  }
+
+  const int ret = run();
+
+  free(params.shmFile);
+  free(params.spiceHost);
+  for(unsigned int i = 0; i < LG_RENDERER_COUNT; ++i)
+  {
+    RendererOpts * opts = &params.rendererOpts[i];
+    for(unsigned int j = 0; j < opts->argc; ++j)
+      free(opts->argv[j].value);
+    free(opts->argv);
+  }
+
+  return ret;
 }

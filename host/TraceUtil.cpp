@@ -17,47 +17,9 @@ this program; if not, write to the Free Software Foundation, Inc., 59 Temple
 Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
-#pragma once
+#include "TraceUtil.h"
 
-#define W32_LEAN_AND_MEAN
-#include <windows.h>
-#include <stdbool.h>
-
-class IVSHMEM
-{
-public:
-  static IVSHMEM * Get()
-  {
-    if (!m_instance)
-      m_instance = new IVSHMEM();
-    return m_instance;
-  }
-
-  bool Initialize();
-  void DeInitialize();
-  bool IsInitialized();
-
-  UINT64 GetSize();
-  UINT16 GetPeerID();
-  UINT16 GetVectors();
-  void * GetMemory();
-  HANDLE CreateVectorEvent(UINT16 vector);
-  bool   RingDoorbell(UINT16 peerID, UINT16 door);
-
-protected:
-
-
-private:
-  static IVSHMEM * m_instance;
-
-  IVSHMEM();
-  ~IVSHMEM();
-
-  bool   m_initialized;
-  HANDLE m_handle;
-
-  UINT64 m_size   ; bool m_gotSize  ;
-  UINT16 m_peerID ; bool m_gotPeerID;
-  void * m_memory ; bool m_gotMemory;
-  UINT16 m_vectors; bool m_gotVectors;
-};
+double        TraceUtil::m_freq;
+LARGE_INTEGER TraceUtil::m_last;
+LARGE_INTEGER TraceUtil::m_start;
+const char *  TraceUtil::m_traceName;

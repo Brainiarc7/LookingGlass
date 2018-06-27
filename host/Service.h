@@ -20,7 +20,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #pragma once
 
 #define W32_LEAN_AND_MEAN
-#include <Windows.h>
+#include <windows.h>
 #include <stdbool.h>
 
 #include "IVSHMEM.h"
@@ -49,17 +49,27 @@ private:
   ~Service();
 
   bool       m_initialized;
+  DWORD      m_consoleSessionID;
   uint8_t  * m_memory;
   IVSHMEM  * m_ivshmem;
   HANDLE     m_timer;
   ICapture * m_capture;
 
-  KVMFRHeader * m_header;
+  KVMFRHeader * m_shmHeader;
+
   uint8_t     * m_frame[2];
   size_t        m_frameSize;
   uint64_t      m_dataOffset[2];
   int           m_frameIndex;
 
-  KVMFRCursor m_cursor;
-  bool        m_haveShape;
+  static DWORD WINAPI _CursorThread(LPVOID lpParameter) { return ((Service *)lpParameter)->CursorThread(); }
+  DWORD CursorThread();
+
+  HANDLE           m_cursorThread;
+  HANDLE           m_cursorEvent;
+  CursorInfo       m_cursorInfo;
+  CRITICAL_SECTION m_cursorCS;
+  size_t           m_cursorDataSize;
+  uint8_t        * m_cursorData;
+  uint64_t         m_cursorOffset;
 };

@@ -17,18 +17,19 @@ this program; if not, write to the Free Software Foundation, Inc., 59 Temple
 Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
-#include <Windows.h>
-#include <Shlwapi.h>
+#include <windows.h>
+#include <shlwapi.h>
 
-#include "common\debug.h"
-#include "vendor\getopt\getopt.h"
+#include "common/debug.h"
+#include "vendor/getopt/getopt.h"
 
 #include "CrashHandler.h"
+#include "TraceUtil.h"
 #include "CaptureFactory.h"
 #include "Service.h"
 
 #include <io.h>
-#include <fcntl.h>
+#include <fcntl.h> 
 #include <iostream>
 
 int parseArgs(struct StartupArgs & args);
@@ -50,6 +51,10 @@ struct StartupArgs
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR szCmdParam, int iCmdShow)
 {
   CrashHandler::Initialize();
+  TraceUtil::Initialize();
+  CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+  SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
 
   struct StartupArgs args;
   args.foreground = false;
@@ -110,8 +115,10 @@ int run(struct StartupArgs & args)
     return -1;
 
   while (true)
+  {
     if (!svc->Process())
       break;
+  }
 
   svc->DeInitialize();
   return 0;

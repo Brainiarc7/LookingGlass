@@ -17,13 +17,15 @@ this program; if not, write to the Free Software Foundation, Inc., 59 Temple
 Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
+#if CONFIG_CAPTURE_NVFBC
+
 #include "NvFBC.h"
 using namespace Capture;
 
 #include <string>
 
-#include "common\debug.h"
-#include "common\memcpySSE.h"
+#include "common/debug.h"
+#include "common/memcpySSE.h"
 #include "Util.h"
 
 #ifdef _WIN64
@@ -63,7 +65,7 @@ bool NvFBC::Initialize(CaptureOptions * options)
   m_hDLL = LoadLibraryA(nvfbc.c_str());
   if (!m_hDLL)
   {
-    DEBUG_ERROR("Failed to load the NvFBC library: %d - %s", GetLastError(), nvfbc.c_str());
+    DEBUG_ERROR("Failed to load the NvFBC library: %d - %s", (int)GetLastError(), nvfbc.c_str());
     return false;
   }
 
@@ -213,7 +215,7 @@ size_t NvFBC::GetMaxFrameSize()
   return m_maxCaptureWidth * m_maxCaptureHeight * 4;
 }
 
-enum GrabStatus NvFBC::GrabFrame(struct FrameInfo & frame)
+enum GrabStatus NvFBC::GrabFrame(struct FrameInfo & frame, struct CursorInfo & cursor)
 {
   if (!m_initialized)
     return GRAB_STATUS_ERROR;
@@ -272,8 +274,8 @@ enum GrabStatus NvFBC::GrabFrame(struct FrameInfo & frame)
         }
 
         // use the smaller or the two dimensions provided just to be sure we don't overflow the buffer
-        const unsigned int realHeight = min(m_grabInfo.dwHeight, screenHeight);
-        const unsigned int realWidth  = min(m_grabInfo.dwWidth , screenWidth );
+        const unsigned int realHeight = LG_MIN(m_grabInfo.dwHeight, screenHeight);
+        const unsigned int realWidth  = LG_MIN(m_grabInfo.dwWidth , screenWidth );
 
         // calculate the new data width and offset to the start of the data
         dataWidth  = realWidth * 4;
@@ -287,6 +289,7 @@ enum GrabStatus NvFBC::GrabFrame(struct FrameInfo & frame)
       }
 
       frame.stride = frame.width;
+      frame.pitch  = dataWidth;
       uint8_t *src = (uint8_t *)m_frameBuffer + dataOffset;
       uint8_t *dst = (uint8_t *)frame.buffer;
       for(unsigned int y = 0; y < frame.height; ++y, dst += dataWidth, src += m_grabInfo.dwBufferWidth * 4)
@@ -311,3 +314,5 @@ enum GrabStatus NvFBC::GrabFrame(struct FrameInfo & frame)
   DEBUG_ERROR("Failed to grab frame");
   return GRAB_STATUS_ERROR;
 }
+
+#endif// CONFIG_CAPTURE_NVFBC

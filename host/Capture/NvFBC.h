@@ -17,14 +17,16 @@ this program; if not, write to the Free Software Foundation, Inc., 59 Temple
 Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
+#if CONFIG_CAPTURE_NVFBC
+
 #pragma once
 #include "ICapture.h"
 
 #define W32_LEAN_AND_MEAN
-#include <Windows.h>
+#include <windows.h>
 
-#include <NvFBC\nvFBC.h>
-#include <NvFBC\nvFBCToSys.h>
+#include <NvFBC/nvFBC.h>
+#include <NvFBC/nvFBCToSys.h>
 
 namespace Capture
 {
@@ -44,9 +46,8 @@ namespace Capture
       return Initialize(m_options);
     }
     enum FrameType GetFrameType();
-    enum FrameComp GetFrameCompression();
     size_t GetMaxFrameSize();
-    enum GrabStatus GrabFrame(struct FrameInfo & frame);
+    enum GrabStatus GrabFrame(struct FrameInfo & frame, struct CursorInfo & cursor);
 
   private:
     CaptureOptions * m_options;
@@ -69,3 +70,5 @@ namespace Capture
     NVFBC_TOSYS_GRAB_FRAME_PARAMS m_grabFrameParams;
   };
 };
+
+#endif //CONFIG_CAPTURE_NVFBC

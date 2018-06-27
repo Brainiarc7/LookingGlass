@@ -23,28 +23,71 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <inttypes.h>
 #include <tmmintrin.h>
 
-#include "common\debug.h"
+#include "common/debug.h"
 
+#if !defined(min)
+#define LG_MIN(a, b) ((a) < (b) ? (a) : (b))
+#else
+#define LG_MIN min
+#endif
+
+#if __MINGW32__
+#define INTERLOCKED_AND8 __sync_and_and_fetch
+#define INTERLOCKED_OR8 __sync_or_and_fetch
+#else
+#define INTERLOCKED_OR8 InterlockedOr8
+#define INTERLOCKED_AND8 InterlockedAnd8
+#endif
 
 class Util
 {
 public:
+  static void DebugWinError(const char * file, const unsigned int line, const char * function, const char * desc, HRESULT status)
+  {
+    char *buffer;
+    FormatMessageA(
+      FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_ALLOCATE_BUFFER,
+      NULL,
+      status,
+      MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+      (char*)&buffer,
+      1024,
+      NULL
+    );
+
+    for(size_t i = strlen(buffer) - 1; i > 0; --i)
+      if (buffer[i] == '\n' || buffer[i] == '\r')
+        buffer[i] = 0;
+
+    fprintf(stderr, "[E] %20s:%-4u | %-30s | %s: 0x%08x (%s)\n", file, line, function, desc, (int)status, buffer);
+    LocalFree(buffer);
+  }
+
   static std::string GetSystemRoot()
   {
     std::string defaultPath;
 
-    size_t pathSize;
-    char *libPath;
+#if __MINGW32__
+    const char  * libPath    = getenv("SystemRoot");
+    const size_t  libPathLen = strlen(libPath);
+#else
+    char  * libPath;
+    size_t  libPathLen;
+    _dupenv_s(&libPath, &libPathLen, "SystemRoot");
+#endif
 
-    if (_dupenv_s(&libPath, &pathSize, "SystemRoot") != 0)
+    if (!libPath)
     {
       DEBUG_ERROR("Unable to get the SystemRoot environment variable");
       return defaultPath;
     }
 
-    if (!pathSize)
+    if (!libPathLen)
     {
       DEBUG_ERROR("The SystemRoot environment variable is not set");
+#ifndef __MINGW32__
+      free(libPath);
+#endif
       return defaultPath;
     }
 #ifdef _WIN64
@@ -58,6 +101,9 @@ public:
     {
       defaultPath = std::string(libPath) + "\\System32";
     }
+#endif
+#ifndef __MINGW32__
+    free(libPath);
 #endif
     return defaultPath;
   }
@@ -103,70 +149,6 @@ public:
       _mm_stream_si128((__m128i *)&dest[0 ], v0);
       _mm_stream_si128((__m128i *)&dest[16], v1);
       _mm_stream_si128((__m128i *)&dest[32], v2);
-    }
-  }
-
-  static void DrawCursor(
-    const enum CursorType   type,
-    const uint8_t         * cursorData,
-    const POINT             cursorRect,
-    const unsigned int      cursorPitch,
-    const POINT             cursorPos,
-    FrameInfo             & frame
-  )
-  {
-    const int maxHeight = min(cursorRect.y, (int)frame.height - cursorPos.y);
-    const int maxWidth  = min(cursorRect.x, (int)frame.width  - cursorPos.x);
-
-    switch (type)
-    {
-      case CURSOR_TYPE_COLOR:
-      {
-        const unsigned int destPitch = frame.stride * 4;
-        for (int y = abs(min(0, cursorPos.y)); y < maxHeight; ++y)
-          for (int x = abs(min(0, cursorPos.x)); x < maxWidth; ++x)
-          {
-            uint8_t *src = (uint8_t *)cursorData + (cursorPitch * y) + (x * 4);
-            uint8_t *dst = (uint8_t *)frame.buffer + (destPitch * (y + cursorPos.y)) + ((x + cursorPos.x) * 4);
-
-            const unsigned int alpha = src[3] + 1;
-            const unsigned int inv = 256 - alpha;
-            dst[0] = (uint8_t)((alpha * src[0] + inv * dst[0]) >> 8);
-            dst[1] = (uint8_t)((alpha * src[1] + inv * dst[1]) >> 8);
-            dst[2] = (uint8_t)((alpha * src[2] + inv * dst[2]) >> 8);
-          }
-        break;
-      }
-
-      case CURSOR_TYPE_MASKED_COLOR:
-      {
-        for (int y = abs(min(0, cursorPos.y)); y < maxHeight; ++y)
-          for (int x = abs(min(0, cursorPos.x)); x < maxWidth; ++x)
-          {
-            uint32_t *src = (uint32_t *)cursorData + ((cursorPitch / 4) * y) + x;
-            uint32_t *dst = (uint32_t *)frame.buffer + (frame.stride * (y + cursorPos.y)) + (x + cursorPos.x);
-            if (*src & 0xff000000)
-              *dst = 0xff000000 | (*dst ^ *src);
-            else *dst = 0xff000000 | *src;
-          }
-        break;
-      }
-
-      case CURSOR_TYPE_MONOCHROME:
-      {
-        for (int y = abs(min(0, cursorPos.y)); y < maxHeight / 2; ++y)
-          for (int x = abs(min(0, cursorPos.x)); x < maxWidth; ++x)
-          {
-            uint8_t  *srcAnd = (uint8_t  *)cursorData + (cursorPitch * y) + (x / 8);
-            uint8_t  *srcXor = srcAnd + cursorPitch * (cursorRect.y / 2);
-            uint32_t *dst = (uint32_t *)frame.buffer + (frame.stride * (y + cursorPos.y)) + (x + cursorPos.x);
-            const uint8_t mask = 0x80 >> (x % 8);
-            const uint32_t andMask = (*srcAnd & mask) ? 0xFFFFFFFF : 0xFF000000;
-            const uint32_t xorMask = (*srcXor & mask) ? 0x00FFFFFF : 0x00000000;
-            *dst = (*dst & andMask) ^ xorMask;
-          }
-        break;
-      }
     }
   }
 };

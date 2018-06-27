@@ -1,5 +1,5 @@
 /*
-Looking Glass - KVM FrameRelay (KVMFR) Client
+KVMGFX Client - A KVM Client for VGA Passthrough
 Copyright (C) 2017 Geoffrey McRae <geoff@hostfission.com>
 https://looking-glass.hostfission.com
 
@@ -17,24 +17,11 @@ this program; if not, write to the Free Software Foundation, Inc., 59 Temple
 Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
-#include <stddef.h>
-#include <stdint.h>
 #include <stdbool.h>
+struct ll;
 
-bool ivshmem_connect(const char * unix_socket);
-void ivshmem_disconnect();
-bool ivshmem_process();
-
-uint16_t ivshmem_get_id();
-void *   ivshmem_get_map();
-size_t   ivshmem_get_map_size();
-
-enum IVSHMEMWaitResult
-{
-  IVSHMEM_WAIT_RESULT_OK,
-  IVSHMEM_WAIT_RESULT_TIMEOUT,
-  IVSHMEM_WAIT_RESULT_ERROR
-};
-
-enum IVSHMEMWaitResult ivshmem_wait_irq(uint16_t vector, unsigned int timeout);
-bool ivshmem_kick_irq(uint16_t clientID, uint16_t vector);
+struct ll * ll_new();
+void        ll_free(struct ll * list);
+void        ll_push(struct ll * list, void * data);
+bool        ll_shift(struct ll * list, void ** data);
+bool        ll_peek_head(struct ll * list, void ** data);
