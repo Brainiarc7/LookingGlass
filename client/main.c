@@ -53,6 +53,7 @@ struct AppState
 
   TTF_Font           * font;
   TTF_Font           * alertFont;
+  bool                 haveSrcSize;
   SDL_Point            srcSize;
   LG_RendererRect      dstRect;
   SDL_Point            cursor;
@@ -103,6 +104,7 @@ struct AppParams
   bool         allowScreensaver;
   bool         grabKeyboard;
   SDL_Scancode captureKey;
+  bool         disableAlerts;
 
   bool         forceRenderer;
   unsigned int forceRendererIndex;
@@ -134,48 +136,50 @@ struct AppParams params =
   .hideMouse        = true,
   .ignoreQuit       = false,
   .allowScreensaver = true,
-  .captureKey       = SDL_SCANCODE_SCROLLLOCK,
   .grabKeyboard     = true,
+  .captureKey       = SDL_SCANCODE_SCROLLLOCK,
+  .disableAlerts    = false,
   .forceRenderer    = false
 };
 
 static inline void updatePositionInfo()
 {
-  if (!state.started)
-    return;
-
   int w, h;
   SDL_GetWindowSize(state.window, &w, &h);
 
-  if (params.keepAspect)
+  if (state.haveSrcSize)
   {
-    const float srcAspect = (float)state.srcSize.y / (float)state.srcSize.x;
-    const float wndAspect = (float)h / (float)w;
-    if (wndAspect < srcAspect)
+    if (params.keepAspect)
     {
-      state.dstRect.w = (float)h / srcAspect;
-      state.dstRect.h = h;
-      state.dstRect.x = (w >> 1) - (state.dstRect.w >> 1);
-      state.dstRect.y = 0;
+      const float srcAspect = (float)state.srcSize.y / (float)state.srcSize.x;
+      const float wndAspect = (float)h / (float)w;
+      if (wndAspect < srcAspect)
+      {
+        state.dstRect.w = (float)h / srcAspect;
+        state.dstRect.h = h;
+        state.dstRect.x = (w >> 1) - (state.dstRect.w >> 1);
+        state.dstRect.y = 0;
+      }
+      else
+      {
+        state.dstRect.w = w;
+        state.dstRect.h = (float)w * srcAspect;
+        state.dstRect.x = 0;
+        state.dstRect.y = (h >> 1) - (state.dstRect.h >> 1);
+      }
     }
     else
     {
-      state.dstRect.w = w;
-      state.dstRect.h = (float)w * srcAspect;
       state.dstRect.x = 0;
-      state.dstRect.y = (h >> 1) - (state.dstRect.h >> 1);
+      state.dstRect.y = 0;
+      state.dstRect.w = w;
+      state.dstRect.h = h;
     }
-  }
-  else
-  {
-    state.dstRect.x = 0;
-    state.dstRect.y = 0;
-    state.dstRect.w = w;
-    state.dstRect.h = h;
-  }
+    state.dstRect.valid = true;
 
-  state.scaleX = (float)state.srcSize.y / (float)state.dstRect.h;
-  state.scaleY = (float)state.srcSize.x / (float)state.dstRect.w;
+    state.scaleX = (float)state.srcSize.y / (float)state.dstRect.h;
+    state.scaleY = (float)state.srcSize.x / (float)state.dstRect.w;
+  }
 
   if (state.lgr)
     state.lgr->on_resize(state.lgrData, w, h, state.dstRect);
@@ -379,6 +383,7 @@ int frameThread(void * unused)
     {
       state.srcSize.x = header.width;
       state.srcSize.y = header.height;
+      state.haveSrcSize = true;
       if (params.autoResize)
         SDL_SetWindowSize(state.window, header.width, header.height);
       updatePositionInfo();
@@ -531,7 +536,7 @@ int eventFilter(void * userdata, SDL_Event * event)
         SDL_SetWindowGrab(state.window, serverMode);
         DEBUG_INFO("Server Mode: %s", serverMode ? "on" : "off");
 
-        if (state.lgr)
+        if (state.lgr && !params.disableAlerts)
           state.lgr->on_alert(
             state.lgrData,
             serverMode ? LG_ALERT_SUCCESS  : LG_ALERT_WARNING,
@@ -1076,6 +1081,7 @@ void doHelp(char * app)
     "  -G        Don't capture the keyboard in capture mode\n"
     "  -m CODE   Specify the capture key [current: %u (%s)]\n"
     "            See https://wiki.libsdl.org/SDLScancodeLookup for valid values\n"
+    "  -q        Disable alert messages [current: %s]\n"
     "\n"
     "  -l        License information\n"
     "\n",
@@ -1091,6 +1097,7 @@ void doHelp(char * app)
     params.w,
     params.h,
     params.captureKey,
+    params.disableAlerts ? "disabled" : "enabled",
     SDL_GetScancodeName(params.captureKey)
   );
 }
@@ -1178,6 +1185,7 @@ static bool load_config(const char * configFile)
     if (config_setting_lookup_bool(global, "fullScreen"      , &itmp)) params.fullscreen       = (itmp != 0);
     if (config_setting_lookup_bool(global, "ignoreQuit"      , &itmp)) params.ignoreQuit       = (itmp != 0);
     if (config_setting_lookup_bool(global, "allowScreensaver", &itmp)) params.allowScreensaver = (itmp != 0);
+    if (config_setting_lookup_bool(global, "disableAlerts"   , &itmp)) params.disableAlerts    = (itmp != 0);
 
     if (config_setting_lookup_int(global, "x", &params.x)) params.center = false;
     if (config_setting_lookup_int(global, "y", &params.y)) params.center = false;
@@ -1318,7 +1326,7 @@ int main(int argc, char * argv[])
 
   for(;;)
   {
-    switch(getopt(argc, argv, "hC:f:L:sc:p:jMvK:kg:o:anrdFx:y:w:b:QSGm:l"))
+    switch(getopt(argc, argv, "hC:f:L:sc:p:jMvK:kg:o:anrdFx:y:w:b:QSGm:lq"))
     {
       case '?':
       case 'h':
@@ -1549,6 +1557,10 @@ int main(int argc, char * argv[])
 
       case 'm':
         params.captureKey = atoi(optarg);
+        continue;
+
+      case 'q':
+        params.disableAlerts = true;
         continue;
 
       case 'l':

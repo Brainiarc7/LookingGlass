@@ -22,6 +22,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <stdbool.h>
 #include <unistd.h>
 #include <malloc.h>
+#include <math.h>
 
 #include <SDL2/SDL_ttf.h>
 
@@ -41,6 +42,8 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #define MOUSE_TEXTURE      1
 #define ALERT_TEXTURE      2
 #define TEXTURE_COUNT      3
+
+#define FADE_TIME 1000000
 
 struct Options
 {
@@ -108,6 +111,10 @@ struct Inst
   struct ll       * alerts;
   int               alertList;
 
+  bool              waiting;
+  uint64_t          waitFadeTime;
+  bool              waitDone;
+
   bool              fpsTexture;
   uint64_t          lastFrameTime;
   uint64_t          renderTime;
@@ -140,7 +147,7 @@ static bool configure(struct Inst * this, SDL_Window *window);
 static void update_mouse_shape(struct Inst * this, bool * newShape);
 static bool draw_frame(struct Inst * this);
 static void draw_mouse(struct Inst * this);
-static void render_wait();
+static void render_wait(struct Inst * this);
 
 const char * opengl_get_name()
 {
@@ -176,8 +183,13 @@ bool opengl_initialize(void * opaque, Uint32 * sdlFlags)
   if (!this)
     return false;
 
+  this->waiting  = true;
+  this->waitDone = false;
+
   *sdlFlags = SDL_WINDOW_OPENGL;
-  SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+  SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER      , 1);
+  SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
+  SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 4);
   return true;
 }
 
@@ -186,6 +198,14 @@ void opengl_deinitialize(void * opaque)
   struct Inst * this = (struct Inst *)opaque;
   if (!this)
     return;
+
+  if (this->preConfigured)
+  {
+    glDeleteLists(this->texList  , BUFFER_COUNT);
+    glDeleteLists(this->mouseList, 1);
+    glDeleteLists(this->fpsList  , 1);
+    glDeleteLists(this->alertList, 1);
+  }
 
   deconfigure(this);
   if (this->mouseData)
@@ -221,7 +241,9 @@ void opengl_on_resize(void * opaque, const int width, const int height, const LG
 
   this->window.x = width;
   this->window.y = height;
-  memcpy(&this->destRect, &destRect, sizeof(LG_RendererRect));
+
+  if (destRect.valid)
+    memcpy(&this->destRect, &destRect, sizeof(LG_RendererRect));
 
   this->resizeWindow = true;
 }
@@ -310,6 +332,12 @@ bool opengl_on_frame_event(void * opaque, const LG_RendererFormat format, const 
   }
   this->frameUpdate = true;
   LG_UNLOCK(this->syncLock);
+
+  if (this->waiting)
+  {
+    this->waiting      = false;
+    this->waitFadeTime = microtime() + FADE_TIME;
+  }
 
   ++this->frameCount;
   return true;
@@ -407,32 +435,23 @@ bool opengl_render(void * opaque, SDL_Window * window)
 
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
-    glTranslatef(this->destRect.x, this->destRect.y, 0.0f);
-    glScalef(
-      (float)this->destRect.w / (float)this->format.width,
-      (float)this->destRect.h / (float)this->format.height,
-      1.0f
-    );
+
+    if (this->destRect.valid)
+    {
+      glTranslatef(this->destRect.x, this->destRect.y, 0.0f);
+      glScalef(
+        (float)this->destRect.w / (float)this->format.width,
+        (float)this->destRect.h / (float)this->format.height,
+        1.0f
+      );
+    }
 
     this->resizeWindow = false;
   }
 
-  if (!configure(this, window))
-  {
-    render_wait();
-    SDL_GL_SwapWindow(window);
-    return true;
-  }
-
-  if (!draw_frame(this))
-    return false;
-
-  if (!this->texReady)
-  {
-    render_wait();
-    SDL_GL_SwapWindow(window);
-    return true;
-  }
+  if (configure(this, window))
+    if (!draw_frame(this))
+      return false;
 
   if (this->params.showFPS && this->renderTime > 1e9)
   {
@@ -486,19 +505,29 @@ bool opengl_render(void * opaque, SDL_Window * window)
         glTexCoord2f(0.0f , 1.0f); glVertex2i(this->fpsRect.x                  , this->fpsRect.y + this->fpsRect.h);
         glTexCoord2f(1.0f,  1.0f); glVertex2i(this->fpsRect.x + this->fpsRect.w, this->fpsRect.y + this->fpsRect.h);
       glEnd();
+      glBindTexture(GL_TEXTURE_2D, 0);
       glDisable(GL_BLEND);
 
       glPopMatrix();
     glEndList();
   }
 
-  bool newShape;
-  update_mouse_shape(this, &newShape);
-
   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
   glClear(GL_COLOR_BUFFER_BIT);
-  glCallList(this->texList + this->texIndex);
-  draw_mouse(this);
+
+  if (this->waiting)
+    render_wait(this);
+  else
+  {
+    bool newShape;
+    update_mouse_shape(this, &newShape);
+    glCallList(this->texList + this->texIndex);
+    draw_mouse(this);
+
+    if (!this->waitDone)
+      render_wait(this);
+  }
+
   if (this->fpsTexture)
     glCallList(this->fpsList);
 
@@ -533,6 +562,7 @@ bool opengl_render(void * opaque, SDL_Window * window)
           glTexCoord2f(0.0f, 1.0f); glVertex2i(0             , alert->text->h);
           glTexCoord2f(1.0f, 1.0f); glVertex2i(alert->text->w, alert->text->h);
         glEnd();
+        glBindTexture(GL_TEXTURE_2D, 0);
         glDisable(GL_BLEND);
       glEndList();
 
@@ -574,10 +604,97 @@ bool opengl_render(void * opaque, SDL_Window * window)
   return true;
 }
 
-static void render_wait()
+void draw_torus(float x, float y, float inner, float outer, unsigned int pts)
 {
-  glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
-  glClear(GL_COLOR_BUFFER_BIT);
+  glBegin(GL_QUAD_STRIP);
+  for (unsigned int i = 0; i <= pts; ++i)
+  {
+    float angle = (i / (float)pts) * M_PI * 2.0f;
+    glVertex2f(x + (inner * cos(angle)), y + (inner * sin(angle)));
+    glVertex2f(x + (outer * cos(angle)), y + (outer * sin(angle)));
+  }
+  glEnd();
+}
+
+void draw_torus_arc(float x, float y, float inner, float outer, unsigned int pts, float s, float e)
+{
+  glBegin(GL_QUAD_STRIP);
+  for (unsigned int i = 0; i <= pts; ++i)
+  {
+    float angle = s + ((i / (float)pts) * e);
+    glVertex2f(x + (inner * cos(angle)), y + (inner * sin(angle)));
+    glVertex2f(x + (outer * cos(angle)), y + (outer * sin(angle)));
+  }
+  glEnd();
+}
+
+static void render_wait(struct Inst * this)
+{
+  float a;
+  if (this->waiting)
+    a = 1.0f;
+  else
+  {
+    uint64_t t = microtime();
+    if (t > this->waitFadeTime)
+    {
+      this->waitDone = true;
+      return;
+    }
+
+    uint64_t delta = this->waitFadeTime - t;
+    a = 1.0f / FADE_TIME * delta;
+  }
+
+  glEnable(GL_BLEND);
+  glPushMatrix();
+  glLoadIdentity();
+  glTranslatef(this->window.x / 2.0f, this->window.y / 2.0f, 0.0f);
+
+  //draw the background gradient
+  glBegin(GL_TRIANGLE_FAN);
+  glColor4f(0.234375f, 0.015625f, 0.425781f, a);
+  glVertex2f(0, 0);
+  glColor4f(0, 0, 0, a);
+  for (unsigned int i = 0; i <= 100; ++i)
+  {
+    float angle = (i / (float)100) * M_PI * 2.0f;
+    glVertex2f(cos(angle) * this->window.x, sin(angle) * this->window.y);
+  }
+  glEnd();
+
+  // draw the logo
+  glColor4f(1.0f, 1.0f, 1.0f, a);
+  glScalef (2.0f, 2.0f, 1.0f);
+
+  draw_torus    (  0,  0, 40, 42, 60);
+  draw_torus    (  0,  0, 32, 34, 60);
+  draw_torus    (-50, -3,  2,  4, 30);
+  draw_torus    ( 50, -3,  2,  4, 30);
+  draw_torus_arc(  0,  0, 51, 49, 60, 0.0f, M_PI);
+
+  glBegin(GL_QUADS);
+    glVertex2f(-1 , 50);
+    glVertex2f(-1 , 76);
+    glVertex2f( 1 , 76);
+    glVertex2f( 1 , 50);
+    glVertex2f(-14, 76);
+    glVertex2f(-14, 78);
+    glVertex2f( 14, 78);
+    glVertex2f( 14, 76);
+    glVertex2f(-21, 83);
+    glVertex2f(-21, 85);
+    glVertex2f( 21, 85);
+    glVertex2f( 21, 83);
+  glEnd();
+
+  draw_torus_arc(-14, 83, 5, 7, 10, M_PI       , M_PI / 2.0f);
+  draw_torus_arc( 14, 83, 5, 7, 10, M_PI * 1.5f, M_PI / 2.0f);
+
+  //FIXME: draw the diagnoal marks on the circle
+
+  glPopMatrix();
+  glDisable(GL_BLEND);
 }
 
 static void handle_opt_mipmap(void * opaque, const char *value)
@@ -706,6 +823,27 @@ static bool pre_configure(struct Inst * this, SDL_Window *window)
     }
   }
 
+  glEnable(GL_TEXTURE_2D);
+  glEnable(GL_COLOR_MATERIAL);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glBlendEquation(GL_FUNC_ADD);
+  glEnable(GL_MULTISAMPLE);
+
+  // generate lists for drawing
+  this->texList   = glGenLists(BUFFER_COUNT);
+  this->mouseList = glGenLists(1);
+  this->fpsList   = glGenLists(1);
+  this->alertList = glGenLists(1);
+
+  // create the overlay textures
+  glGenTextures(TEXTURE_COUNT, this->textures);
+  if (check_gl_error("glGenTextures"))
+  {
+    LG_UNLOCK(this->formatLock);
+    return false;
+  }
+  this->hasTextures = true;
+
   SDL_GL_SetSwapInterval(this->opt.vsync ? 1 : 0);
   this->preConfigured = true;
   return true;
@@ -774,12 +912,6 @@ static bool configure(struct Inst * this, SDL_Window *window)
   this->texSize =
     this->format.height *
     this->decoder->get_frame_pitch(this->decoderData);
-
-  // generate lists for drawing
-  this->texList    = glGenLists(BUFFER_COUNT);
-  this->fpsList    = glGenLists(1);
-  this->mouseList  = glGenLists(1);
-  this->alertList  = glGenLists(1);
 
   // generate the pixel unpack buffers if the decoder isn't going to do it for us
   if (!this->decoder->has_gl)
@@ -850,15 +982,6 @@ static bool configure(struct Inst * this, SDL_Window *window)
     }
   }
 
-  // create the overlay textures
-  glGenTextures(TEXTURE_COUNT, this->textures);
-  if (check_gl_error("glGenTextures"))
-  {
-    LG_UNLOCK(this->formatLock);
-    return false;
-  }
-  this->hasTextures = true;
-
   // create the frame textures
   glGenTextures(BUFFER_COUNT, this->frames);
   if (check_gl_error("glGenTextures"))
@@ -926,16 +1049,12 @@ static bool configure(struct Inst * this, SDL_Window *window)
         glTexCoord2f(0.0f, 1.0f); glVertex2i(0                 , this->format.height);
         glTexCoord2f(1.0f, 1.0f); glVertex2i(this->format.width, this->format.height);
      glEnd();
+     glBindTexture(GL_TEXTURE_2D, 0);
     glEndList();
   }
 
   glBindTexture(GL_TEXTURE_2D, 0);
   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
-  glEnable(GL_TEXTURE_2D);
-  glEnable(GL_COLOR_MATERIAL);
-  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-  glBlendEquation(GL_FUNC_ADD);
 
   this->resizeWindow = true;
   this->drawStart    = nanotime();
@@ -1144,6 +1263,7 @@ static void update_mouse_shape(struct Inst * this, bool * newShape)
           glTexCoord2f(0.0f, 1.0f); glVertex2i(0    , hheight);
           glTexCoord2f(1.0f, 1.0f); glVertex2i(width, hheight);
         glEnd();
+        glBindTexture(GL_TEXTURE_2D, 0);
         glDisable(GL_COLOR_LOGIC_OP);
       glEndList();
       break;
